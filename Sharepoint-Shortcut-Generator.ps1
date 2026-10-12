@@ -9,9 +9,8 @@
     It manages OAuth2 authentication with the Microsoft Graph API.
     The script checks for the WebView2 runtime and installs it if required.
     It authenticates with the Microsoft Admin Center to access private OneDrive profiles.
-    Using the Microsoft Graph API, it retrieves all users in the tenant and allows you to select which users to process.
-    It allows you to select which SharePoint sites and folders to work with.
-    The script then generates shortcuts for the selected users, sites, and folders.
+    Using the Microsoft Graph API, it looks up the user and the SharePoint site/library configured in the script.
+    The script then generates a shortcut in the user's OneDrive that points to the configured SharePoint library.
 
     .PARAMETER tenantId
     Your Microsoft Tenant ID.
@@ -29,6 +28,9 @@
     .\Sharepoint-Shortcut-Generator.ps1 -tenantId 'your-tenant-id' -clientId 'your-client-id' -Verbose
 
     .NOTES
+    The source library (the user's OneDrive / MySite) and the destination library (the SharePoint Online document library
+    the shortcut points to) are set as strings in the "Hardcoded libraries" section near the top of the script.
+    Their site, drive, and list IDs are looked up through the Graph API at runtime.
     Required permissions (scopes): files.readwrite.all, user.read.all, allsites.fullcontrol, allsites.manage, myfiles.read, myfiles.write, and user.readwrite.all.
     These permissions are found in the Microsoft Graph and SharePoint APIs.
     - files.readwrite.all and user.read.all are Microsoft Graph permissions.
@@ -64,6 +66,14 @@ Get the Client ID of your registered application: https://learn.microsoft.com/az
 "@)]
     [string]$clientId
 )
+
+# Hardcoded libraries - edit these strings before each run.
+# Source library: the user's OneDrive (MySite) URL, where the shortcut is created.
+$SourceLibraryUrl = 'https://contoso-my.sharepoint.com/personal/jdoe_contoso_com/Documents'
+# Destination library: the SharePoint Online document library the shortcut points to.
+$DestinationLibraryUrl = 'https://contoso.sharepoint.com/sites/Team/Shared Documents'
+# Name of the shortcut shown in OneDrive. Leave empty to use the destination site's name.
+$ShortcutName = ''
 
 $SetVerbose = $false
 if ($PSCmdlet.MyInvocation.BoundParameters["Verbose"]) {
@@ -451,7 +461,6 @@ $requests.counter = 0
 
 Invoke-Expression -Command "$workpath\Import-Assemblies.ps1"
 Import-Module -Name "$workpath\PSAuthClient\PSAuthClient.psd1" -Force
-Import-Module -Name "$workpath\Functions\Forms-Functions.ps1" -Force
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 
@@ -806,21 +815,28 @@ $allUsersObj = $allUsers | ConvertFrom-Json
 $usersAllTable = ($allUsersObj.value | Select-Object DisplayName, mail, id | Format-Table -AutoSize | Out-String).Trim()
 Write-Verbose "All users in tenant:`n$usersAllTable"
 
-Write-Host "Showing user selection form..."
-Write-Host "Please select the users you want to work with..."
-
+Write-Host "Resolving user from source library URL..."
+$selectedUsers = @()
+$personalSegment = $null
 try {
-    # Only call ONCE and assign result
-    $selectedUsers = Show-UserSelectionForm -userList $allUsersObj.value -Verbose:$SetVerbose
-    if ($LASTEXITCODE -ne 0) {
-        Write-Error "Error: Unable to show user selection form."
-        pause
-        exit 1
-    }
-} catch {
-    Write-Error "Error: $($_.Exception.Message)"
+    $personalPath = ([uri]$SourceLibraryUrl.Trim()).AbsolutePath.Trim('/')
+    if ($personalPath -match '^personal/([^/]+)') { $personalSegment = $Matches[1] }
+} catch { }
+if (-not $personalSegment) {
+    Write-Error "SourceLibraryUrl '$SourceLibraryUrl' is not a valid OneDrive URL (expected https://<tenant>-my.sharepoint.com/personal/<user>/...). Exiting..."
     pause
     exit 1
+}
+# OneDrive URLs replace every non-alphanumeric character in the UPN with an underscore
+$match = @($allUsersObj.value | Where-Object {
+    $_.userPrincipalName -and (($_.userPrincipalName -replace '[^A-Za-z0-9]', '_') -eq $personalSegment)
+})
+if ($match.Count -eq 1) {
+    $selectedUsers = $match
+} elseif ($match.Count -gt 1) {
+    Write-Warning "SourceLibraryUrl '$SourceLibraryUrl' matches multiple users."
+} else {
+    Write-Warning "No user found in the tenant for SourceLibraryUrl '$SourceLibraryUrl'."
 }
 
 if (-not $selectedUsers -or $selectedUsers.Count -eq 0) {
@@ -838,50 +854,47 @@ Write-Verbose "Selected users count: $($users.list.Count)"
 $usersTable = ($users.list | Select-Object DisplayName, Mail, Id | Format-Table -AutoSize | Out-String).Trim()
 Write-Verbose "Selected users:`n$usersTable"
 
-Write-Host "Getting all sites in tenant..."
+Write-Host "Looking up destination site..."
 
 try {
-    $allSites = Send-GraphRequest -Method GET -Uri "$graphEndpoint/sites?search=*" -AccessToken "$accessToken" -Verbose:$SetVerbose
-    if ($LASTEXITCODE -ne 0) {
-        Write-Error "Error: Unable to get sites from Graph API."
-        pause
-        exit 1
-    }
+    $destUri = [uri]$DestinationLibraryUrl.Trim()
+    $destSegments = @($destUri.AbsolutePath.Trim('/') -split '/' | Where-Object { $_ } | ForEach-Object { [uri]::UnescapeDataString($_) })
 } catch {
-    Write-Error "Error: $($_.Exception.Message)"
+    Write-Error "DestinationLibraryUrl '$DestinationLibraryUrl' is not a valid URL. Exiting..."
     pause
     exit 1
 }
 
-$allSitesObj = $allSites | ConvertFrom-Json
-
-# Parse the structured site IDs into their components
-foreach ($site in $allSitesObj.value) {
-    if ($site.id -match "([^,]+),([^,]+),(.+)") {
-        $site | Add-Member -NotePropertyName "domainId" -NotePropertyValue $Matches[1] -Force
-        $site | Add-Member -NotePropertyName "siteId" -NotePropertyValue $Matches[2] -Force
-        $site | Add-Member -NotePropertyName "webId" -NotePropertyValue $Matches[3] -Force
-    }
+if ($destSegments.Count -ge 2 -and $destSegments[0] -in @('sites', 'teams')) {
+    $sitePath = "/$($destSegments[0])/$($destSegments[1])"
+    $libraryName = if ($destSegments.Count -ge 3) { $destSegments[2] } else { 'Documents' }
+} else {
+    $sitePath = ''
+    $libraryName = if ($destSegments.Count -ge 1) { $destSegments[0] } else { 'Documents' }
 }
+# The default library's URL segment is "Shared Documents" but its drive name is "Documents"
+if ($libraryName -eq 'Shared Documents') { $libraryName = 'Documents' }
 
-$sitesAllTable = ($allSitesObj.value | Select-Object DisplayName, WebUrl | Format-Table -AutoSize | Out-String).Trim()
-Write-Verbose "All sites in tenant:`n$sitesAllTable"
-
-Write-Host "Showing site selection form..."
-Write-Host "Please select the sites you want to work with..."
+$siteLookupUri = if ($sitePath) { "$graphEndpoint/sites/$($destUri.Host):$($sitePath)" } else { "$graphEndpoint/sites/$($destUri.Host)" }
 
 try {
-    $selectedSites = Show-SiteSelectionForm -SiteList $allSitesObj.value -Verbose:$SetVerbose
-    if ($LASTEXITCODE -ne 0) {
-        Write-Error "Error: Unable to show site selection form."
-        pause
-        exit 1
-    }
+    $siteResponse = Send-GraphRequest -Method GET -Uri $siteLookupUri -AccessToken "$accessToken" -Verbose:$SetVerbose
 } catch {
-    Write-Error "Error: $($_.Exception.Message)"
+    Write-Error "Error: Unable to find site for DestinationLibraryUrl '$DestinationLibraryUrl'. $($_.Exception.Message)"
     pause
     exit 1
 }
+
+$siteObj = $siteResponse | ConvertFrom-Json
+
+# Parse the structured site ID into its components
+if ($siteObj.id -match "([^,]+),([^,]+),(.+)") {
+    $siteObj | Add-Member -NotePropertyName "domainId" -NotePropertyValue $Matches[1] -Force
+    $siteObj | Add-Member -NotePropertyName "siteId" -NotePropertyValue $Matches[2] -Force
+    $siteObj | Add-Member -NotePropertyName "webId" -NotePropertyValue $Matches[3] -Force
+}
+
+$selectedSites = @($siteObj)
 
 if (-not $selectedSites -or $selectedSites.Count -eq 0) {
     Write-Error "No sites selected. Exiting..."
@@ -929,15 +942,16 @@ foreach ($site in $sites.list) {
 
     $driveObj = $drive | ConvertFrom-Json
 
-    # Check if drive includes a value where name is Documents
-    $documentsLibrary = $driveObj.value | Where-Object {$_.name -eq "Documents"}
+    # Find the destination library's drive by name
+    $documentsLibrary = $driveObj.value | Where-Object {$_.name -eq $libraryName}
     
     if ($documentsLibrary) {
         $site.DriveId = $documentsLibrary.id
-        Write-Verbose "Documents library found for site: $($site.DisplayName)"
+        $site | Add-Member -NotePropertyName "LibraryWebUrl" -NotePropertyValue $documentsLibrary.webUrl -Force
+        Write-Verbose "'$libraryName' library found for site: $($site.DisplayName)"
         $validSites += $site
     } else {
-        Write-Warning "No Documents library found for site: $($site.DisplayName) - Removing from site list"
+        Write-Warning "No '$libraryName' library found for site: $($site.DisplayName) - Removing from site list"
     }
 }
 
@@ -1057,48 +1071,35 @@ if ($totalaccessCount -eq 0) {
     exit
 }
 
-# Get DriveList with proper structure for the folders form
-$driveList = @()
+# Build the shortcut target from the destination library (shortcut points to the library root)
+$selectedFolders = @()
 foreach ($site in $sites.list) {
     if ($site.DriveId) {
-        $driveList += [PSCustomObject]@{
-            id = $site.DriveId
-            name = "Documents"
-            siteDisplayName = $site.DisplayName
-            siteId = $site.id
-            webUrl = $site.WebUrl
-            domainId = $site.domainId
+        $selectedFolders += [PSCustomObject]@{
+            DriveId = $site.DriveId
+            DriveName = $libraryName
+            SiteDisplayName = $site.DisplayName
+            FolderId = "root"
+            FolderName = $libraryName
+            DisplayName = if ($ShortcutName) { $ShortcutName } else { $site.DisplayName }
+            WebUrl = $site.LibraryWebUrl
+            Path = "/"
             webId = $site.webId
+            siteId = $site.id
+            siteWebUrl = $site.WebUrl
             domainSiteId = $site.siteId
         }
     }
 }
 
-Write-Host "Getting folders for selected drives..."
-Write-Host "Please select the folders you want to work with..."
-try {
-    # Show the folder selection form
-    $selectedFolders = Show-FolderSelectionForm -DriveList $driveList -AccessToken $accessToken -Verbose:$SetVerbose
-    if ($LASTEXITCODE -ne 0) {
-        Write-Error "Error: Unable to get folders from Graph API."
-        pause
-        exit 1
-    }
-} catch {
-    Write-Error "Error: $($_.Exception.Message)"
-    pause
-    exit 1
-}
-
-# Display selected folders
 if (-not $selectedFolders -or $selectedFolders.Count -eq 0) {
-    Write-Error "No folders selected. Exiting..."
+    Write-Error "Destination library could not be resolved. Exiting..."
     pause
     exit
 }
 
 # Print selected folders
-Write-Host "Selected Folders:" -ForegroundColor Cyan
+Write-Host "Shortcut target:" -ForegroundColor Cyan
 $foldersTable = $selectedFolders | Format-Table -Property FolderName,SiteDisplayName -AutoSize | Out-String
 Write-Host $foldersTable
 
@@ -1166,28 +1167,7 @@ foreach ($folder in $selectedFolders) {
     }
 }
 
-Write-Host "You can now edit the folder names for shortcut creation."
-
-try {
-    # Show the folder name edit form
-    $editedFolders = Show-FolderNameEditForm -SelectedFolders $selectedFolders -Verbose:$SetVerbose
-    if ($LASTEXITCODE -ne 0) {
-        Write-Error "Error: Unable to show folder name edit form."
-        pause
-        exit 1
-    }
-} catch {
-    Write-Error "Error: $($_.Exception.Message)"
-    pause
-    exit 1
-}
-
-# Check if user canceled the edit form
-if (-not $editedFolders -or $editedFolders.Count -eq 0) {
-    Write-Error "Folder editing was canceled. Exiting..."
-    pause
-    exit
-}
+$editedFolders = $selectedFolders
 
 Write-Host "Associating folders with users..."
 
