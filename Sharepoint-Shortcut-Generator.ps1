@@ -25,19 +25,19 @@
     Documentation:
     How to get the Client ID of your registered application: https://learn.microsoft.com/azure/healthcare-apis/register-application#application-id-client-id
 
-    .PARAMETER Users
-    Optional. One or more users to process, given as UPN, email address, object ID or display name.
+    .PARAMETER UserUrl
+    Optional. A single user's OneDrive (MySite) URL, e.g. https://contoso-my.sharepoint.com/personal/jdoe_contoso_com.
     When supplied, the user picker is skipped.
 
-    .PARAMETER Sites
-    Optional. One or more SharePoint site URLs to process (e.g. https://contoso.sharepoint.com/sites/Team).
+    .PARAMETER SiteUrl
+    Optional. A single destination SharePoint Online site URL, e.g. https://contoso.sharepoint.com/sites/Team.
     When supplied, the site picker is skipped.
 
     .EXAMPLE
     .\Sharepoint-Shortcut-Generator.ps1 -tenantId 'your-tenant-id' -clientId 'your-client-id' -Verbose
 
     .EXAMPLE
-    .\Sharepoint-Shortcut-Generator.ps1 -tenantId 'your-tenant-id' -clientId 'your-client-id' -Users 'a@contoso.com','b@contoso.com' -Sites 'https://contoso.sharepoint.com/sites/Team'
+    .\Sharepoint-Shortcut-Generator.ps1 -tenantId 'your-tenant-id' -clientId 'your-client-id' -UserUrl 'https://contoso-my.sharepoint.com/personal/jdoe_contoso_com' -SiteUrl 'https://contoso.sharepoint.com/sites/Team'
 
     .NOTES
     Required permissions (scopes): files.readwrite.all, user.read.all, allsites.fullcontrol, allsites.manage, myfiles.read, myfiles.write, and user.readwrite.all.
@@ -75,11 +75,11 @@ Get the Client ID of your registered application: https://learn.microsoft.com/az
 "@)]
     [string]$clientId,
     [Parameter(Mandatory=$false,
-    HelpMessage = "Optional. One or more users (UPN, email address, object ID or display name). When supplied, the user picker is skipped.")]
-    [string[]]$Users,
+    HelpMessage = "Optional. A single user's OneDrive (MySite) URL, e.g. https://contoso-my.sharepoint.com/personal/jdoe_contoso_com. When supplied, the user picker is skipped.")]
+    [string]$UserUrl,
     [Parameter(Mandatory=$false,
-    HelpMessage = "Optional. One or more SharePoint site URLs (e.g. https://contoso.sharepoint.com/sites/Team). When supplied, the site picker is skipped.")]
-    [string[]]$Sites
+    HelpMessage = "Optional. A single destination SharePoint site URL, e.g. https://contoso.sharepoint.com/sites/Team. When supplied, the site picker is skipped.")]
+    [string]$SiteUrl
 )
 
 $SetVerbose = $false
@@ -823,20 +823,29 @@ $allUsersObj = $allUsers | ConvertFrom-Json
 $usersAllTable = ($allUsersObj.value | Select-Object DisplayName, mail, id | Format-Table -AutoSize | Out-String).Trim()
 Write-Verbose "All users in tenant:`n$usersAllTable"
 
-if ($Users) {
-    Write-Host "Resolving supplied users..."
+if ($UserUrl) {
+    Write-Host "Resolving supplied user OneDrive URL..."
     $selectedUsers = @()
-    foreach ($entry in ($Users | ForEach-Object { $_.Trim() } | Where-Object { $_ })) {
-        $match = @($allUsersObj.value | Where-Object {
-            $_.userPrincipalName -eq $entry -or $_.mail -eq $entry -or $_.id -eq $entry -or $_.displayName -eq $entry
-        })
-        if ($match.Count -eq 1) {
-            if ($selectedUsers.id -notcontains $match[0].id) { $selectedUsers += $match[0] }
-        } elseif ($match.Count -gt 1) {
-            Write-Warning "User '$entry' matches multiple users - use the UPN or object ID. Skipping."
-        } else {
-            Write-Warning "User '$entry' was not found in the tenant. Skipping."
-        }
+    $personalSegment = $null
+    try {
+        $personalPath = ([uri]$UserUrl.Trim()).AbsolutePath.Trim('/')
+        if ($personalPath -match '^personal/([^/]+)') { $personalSegment = $Matches[1] }
+    } catch { }
+    if (-not $personalSegment) {
+        Write-Error "UserUrl '$UserUrl' is not a valid OneDrive URL (expected https://<tenant>-my.sharepoint.com/personal/<user>). Exiting..."
+        pause
+        exit 1
+    }
+    # OneDrive URLs replace every non-alphanumeric character in the UPN with an underscore
+    $match = @($allUsersObj.value | Where-Object {
+        $_.userPrincipalName -and (($_.userPrincipalName -replace '[^A-Za-z0-9]', '_') -eq $personalSegment)
+    })
+    if ($match.Count -eq 1) {
+        $selectedUsers = $match
+    } elseif ($match.Count -gt 1) {
+        Write-Warning "UserUrl '$UserUrl' matches multiple users."
+    } else {
+        Write-Warning "No user found in the tenant for UserUrl '$UserUrl'."
     }
 } else {
     Write-Host "Showing user selection form..."
@@ -901,17 +910,12 @@ foreach ($site in $allSitesObj.value) {
 $sitesAllTable = ($allSitesObj.value | Select-Object DisplayName, WebUrl | Format-Table -AutoSize | Out-String).Trim()
 Write-Verbose "All sites in tenant:`n$sitesAllTable"
 
-if ($Sites) {
-    Write-Host "Resolving supplied sites..."
-    $selectedSites = @()
-    foreach ($entry in ($Sites | ForEach-Object { $_.Trim() } | Where-Object { $_ })) {
-        $normalized = $entry.TrimEnd('/')
-        $match = @($allSitesObj.value | Where-Object { $_.webUrl -and $_.webUrl.TrimEnd('/') -eq $normalized } | Select-Object -First 1)
-        if ($match.Count -eq 1) {
-            if ($selectedSites.id -notcontains $match[0].id) { $selectedSites += $match[0] }
-        } else {
-            Write-Warning "Site '$entry' was not found in the tenant. Skipping."
-        }
+if ($SiteUrl) {
+    Write-Host "Resolving supplied site..."
+    $normalized = $SiteUrl.Trim().TrimEnd('/')
+    $selectedSites = @($allSitesObj.value | Where-Object { $_.webUrl -and $_.webUrl.TrimEnd('/') -eq $normalized } | Select-Object -First 1)
+    if ($selectedSites.Count -eq 0) {
+        Write-Warning "Site '$SiteUrl' was not found in the tenant."
     }
 } else {
     Write-Host "Showing site selection form..."
