@@ -35,6 +35,14 @@ You can run the `Sharepoint-Shortcut-Generator` script as follows:
 .\Sharepoint-Shortcut-Generator.ps1 -tenantId 'your-tenant-id' -clientId 'your-client-id' -Verbose
 ```
 
+By default, pickers are shown to select users and sites. Instead, you can type the values directly with the optional `-Users` and `-Sites` parameters; each one you supply skips its picker (you can supply just one). Users may be a UPN, email address, object ID or display name; sites are SharePoint site URLs. Values not found in the tenant are skipped with a warning.
+
+```powershell
+.\Sharepoint-Shortcut-Generator.ps1 -tenantId 'your-tenant-id' -clientId 'your-client-id' `
+    -Users 'a@contoso.com','b@contoso.com' `
+    -Sites 'https://contoso.sharepoint.com/sites/Team'
+```
+
 The same usage applies to the `OneDrive-Provisioning` script:
 
 ```powershell

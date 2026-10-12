@@ -25,8 +25,19 @@
     Documentation:
     How to get the Client ID of your registered application: https://learn.microsoft.com/azure/healthcare-apis/register-application#application-id-client-id
 
+    .PARAMETER Users
+    Optional. One or more users to process, given as UPN, email address, object ID or display name.
+    When supplied, the user picker is skipped.
+
+    .PARAMETER Sites
+    Optional. One or more SharePoint site URLs to process (e.g. https://contoso.sharepoint.com/sites/Team).
+    When supplied, the site picker is skipped.
+
     .EXAMPLE
     .\Sharepoint-Shortcut-Generator.ps1 -tenantId 'your-tenant-id' -clientId 'your-client-id' -Verbose
+
+    .EXAMPLE
+    .\Sharepoint-Shortcut-Generator.ps1 -tenantId 'your-tenant-id' -clientId 'your-client-id' -Users 'a@contoso.com','b@contoso.com' -Sites 'https://contoso.sharepoint.com/sites/Team'
 
     .NOTES
     Required permissions (scopes): files.readwrite.all, user.read.all, allsites.fullcontrol, allsites.manage, myfiles.read, myfiles.write, and user.readwrite.all.
@@ -62,7 +73,13 @@ This is the ID of your registered application in Azure AD.
 Docs:
 Get the Client ID of your registered application: https://learn.microsoft.com/azure/healthcare-apis/register-application#application-id-client-id
 "@)]
-    [string]$clientId
+    [string]$clientId,
+    [Parameter(Mandatory=$false,
+    HelpMessage = "Optional. One or more users (UPN, email address, object ID or display name). When supplied, the user picker is skipped.")]
+    [string[]]$Users,
+    [Parameter(Mandatory=$false,
+    HelpMessage = "Optional. One or more SharePoint site URLs (e.g. https://contoso.sharepoint.com/sites/Team). When supplied, the site picker is skipped.")]
+    [string[]]$Sites
 )
 
 $SetVerbose = $false
@@ -806,21 +823,38 @@ $allUsersObj = $allUsers | ConvertFrom-Json
 $usersAllTable = ($allUsersObj.value | Select-Object DisplayName, mail, id | Format-Table -AutoSize | Out-String).Trim()
 Write-Verbose "All users in tenant:`n$usersAllTable"
 
-Write-Host "Showing user selection form..."
-Write-Host "Please select the users you want to work with..."
+if ($Users) {
+    Write-Host "Resolving supplied users..."
+    $selectedUsers = @()
+    foreach ($entry in ($Users | ForEach-Object { $_.Trim() } | Where-Object { $_ })) {
+        $match = @($allUsersObj.value | Where-Object {
+            $_.userPrincipalName -eq $entry -or $_.mail -eq $entry -or $_.id -eq $entry -or $_.displayName -eq $entry
+        })
+        if ($match.Count -eq 1) {
+            if ($selectedUsers.id -notcontains $match[0].id) { $selectedUsers += $match[0] }
+        } elseif ($match.Count -gt 1) {
+            Write-Warning "User '$entry' matches multiple users - use the UPN or object ID. Skipping."
+        } else {
+            Write-Warning "User '$entry' was not found in the tenant. Skipping."
+        }
+    }
+} else {
+    Write-Host "Showing user selection form..."
+    Write-Host "Please select the users you want to work with..."
 
-try {
-    # Only call ONCE and assign result
-    $selectedUsers = Show-UserSelectionForm -userList $allUsersObj.value -Verbose:$SetVerbose
-    if ($LASTEXITCODE -ne 0) {
-        Write-Error "Error: Unable to show user selection form."
+    try {
+        # Only call ONCE and assign result
+        $selectedUsers = Show-UserSelectionForm -userList $allUsersObj.value -Verbose:$SetVerbose
+        if ($LASTEXITCODE -ne 0) {
+            Write-Error "Error: Unable to show user selection form."
+            pause
+            exit 1
+        }
+    } catch {
+        Write-Error "Error: $($_.Exception.Message)"
         pause
         exit 1
     }
-} catch {
-    Write-Error "Error: $($_.Exception.Message)"
-    pause
-    exit 1
 }
 
 if (-not $selectedUsers -or $selectedUsers.Count -eq 0) {
@@ -867,20 +901,34 @@ foreach ($site in $allSitesObj.value) {
 $sitesAllTable = ($allSitesObj.value | Select-Object DisplayName, WebUrl | Format-Table -AutoSize | Out-String).Trim()
 Write-Verbose "All sites in tenant:`n$sitesAllTable"
 
-Write-Host "Showing site selection form..."
-Write-Host "Please select the sites you want to work with..."
+if ($Sites) {
+    Write-Host "Resolving supplied sites..."
+    $selectedSites = @()
+    foreach ($entry in ($Sites | ForEach-Object { $_.Trim() } | Where-Object { $_ })) {
+        $normalized = $entry.TrimEnd('/')
+        $match = @($allSitesObj.value | Where-Object { $_.webUrl -and $_.webUrl.TrimEnd('/') -eq $normalized } | Select-Object -First 1)
+        if ($match.Count -eq 1) {
+            if ($selectedSites.id -notcontains $match[0].id) { $selectedSites += $match[0] }
+        } else {
+            Write-Warning "Site '$entry' was not found in the tenant. Skipping."
+        }
+    }
+} else {
+    Write-Host "Showing site selection form..."
+    Write-Host "Please select the sites you want to work with..."
 
-try {
-    $selectedSites = Show-SiteSelectionForm -SiteList $allSitesObj.value -Verbose:$SetVerbose
-    if ($LASTEXITCODE -ne 0) {
-        Write-Error "Error: Unable to show site selection form."
+    try {
+        $selectedSites = Show-SiteSelectionForm -SiteList $allSitesObj.value -Verbose:$SetVerbose
+        if ($LASTEXITCODE -ne 0) {
+            Write-Error "Error: Unable to show site selection form."
+            pause
+            exit 1
+        }
+    } catch {
+        Write-Error "Error: $($_.Exception.Message)"
         pause
         exit 1
     }
-} catch {
-    Write-Error "Error: $($_.Exception.Message)"
-    pause
-    exit 1
 }
 
 if (-not $selectedSites -or $selectedSites.Count -eq 0) {
